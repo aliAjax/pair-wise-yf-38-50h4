@@ -27,6 +27,10 @@ class InvalidTransition(DomainError):
     """The requested state transition is not valid."""
 
 
+class ScopeViolation(PermissionDenied):
+    """Requested field is outside the grant's fixed field scope."""
+
+
 class Role(str, Enum):
     viewer = "viewer"
     admin = "admin"

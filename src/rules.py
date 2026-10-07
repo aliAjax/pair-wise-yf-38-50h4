@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 
 from .domain import (
     ConflictError,
@@ -8,9 +8,53 @@ from .domain import (
 )
 
 
+# 字段敏感度分级：数字越大越敏感。外单位默认 clearance=2，内单位默认 clearance=3。
+SENSITIVITY_LEVELS = {"public": 1, "internal": 2, "sensitive": 3, "restricted": 4}
+DEFAULT_FIELDS = [
+    {"name": "sample_id", "sensitivity": 1},
+    {"name": "phenotype", "sensitivity": 2},
+    {"name": "diagnosis", "sensitivity": 2},
+    {"name": "variant", "sensitivity": 3},
+    {"name": "raw_sequence", "sensitivity": 4},
+]
+DEFAULT_CLEARANCE = {"internal": 3, "external": 2}
+
+
+def utcnow():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _normalize_fields(fields):
+    if not isinstance(fields, list) or not fields:
+        raise ValidationError("fields must be a non-empty list")
+    seen = set()
+    normalized = []
+    for item in fields:
+        if not isinstance(item, dict):
+            raise ValidationError("each field must be an object with name and sensitivity")
+        name = str(item.get("name", "")).strip()
+        if not name:
+            raise ValidationError("field name is required")
+        if name in seen:
+            raise ValidationError("duplicate field: " + name)
+        sensitivity = item.get("sensitivity")
+        if isinstance(sensitivity, str):
+            sensitivity = SENSITIVITY_LEVELS.get(str(sensitivity).strip().lower())
+        if not isinstance(sensitivity, int) or sensitivity < 1 or sensitivity > 4:
+            raise ValidationError("field sensitivity must be between 1 and 4")
+        seen.add(name)
+        normalized.append({"name": name, "sensitivity": sensitivity})
+    return normalized
+
+
 def _validate_dataset(actor, data, lookup):
     if len(data.get("access_policy", "")) < 3:
         raise ValidationError("access_policy is required")
+    if data.get("fields"):
+        data["fields"] = _normalize_fields(data["fields"])
+    elif "fields" not in data:
+        data["fields"] = [dict(item) for item in DEFAULT_FIELDS]
+    data.setdefault("classification_version", 1)
 
 
 def _validate_application(actor, data, lookup):
@@ -19,6 +63,25 @@ def _validate_application(actor, data, lookup):
         raise ValidationError("dataset does not exist")
     if not data.get("purpose", "").strip():
         raise ValidationError("purpose is required")
+    fields = dataset["data"].get("fields") or DEFAULT_FIELDS
+    names = {item["name"] for item in fields}
+    requested = data.get("requested_fields")
+    if requested is not None:
+        if not isinstance(requested, list):
+            raise ValidationError("requested_fields must be a list")
+        unknown = [item for item in requested if item not in names]
+        if unknown:
+            raise ValidationError("requested fields not in dataset: " + ", ".join(unknown))
+    org_type = str(data.get("org_type", "external")).strip().lower()
+    if org_type not in ("internal", "external"):
+        raise ValidationError("org_type must be internal or external")
+    data["org_type"] = org_type
+    if "clearance_level" not in data or data.get("clearance_level") is None:
+        data["clearance_level"] = DEFAULT_CLEARANCE[org_type]
+    else:
+        level = data["clearance_level"]
+        if not isinstance(level, int) or level < 1 or level > 4:
+            raise ValidationError("clearance_level must be between 1 and 4")
 
 
 def _validate_approve(actor, entity, data, lookup):
@@ -27,6 +90,26 @@ def _validate_approve(actor, entity, data, lookup):
         raise ValidationError("at least three distinct committee approvals are required")
     if data.get("conflict_of_interest"):
         raise PermissionDenied("conflicted reviewer cannot approve access")
+    app_data = entity["data"]
+    dataset = _find_one(lookup, "dataset", "id", app_data.get("dataset_id"))
+    if not dataset:
+        raise ValidationError("dataset does not exist")
+    fields = dataset["data"].get("fields") or DEFAULT_FIELDS
+    clearance = int(app_data.get("clearance_level", 2))
+    requested = app_data.get("requested_fields")
+    scope = [
+        item["name"]
+        for item in fields
+        if item["sensitivity"] <= clearance
+        and (not requested or item["name"] in requested)
+    ]
+    if not scope:
+        raise ValidationError("no fields within clearance for this application")
+    return {
+        "field_scope": scope,
+        "scope_frozen_at": utcnow(),
+        "scope_classification_version": dataset["data"].get("classification_version", 1),
+    }
 
 
 def valid_grant_window(expires_at, as_of):
@@ -36,11 +119,45 @@ def valid_grant_window(expires_at, as_of):
 def _validate_grant_activate(actor, entity, data, lookup):
     if data.get("expires_at") < data.get("starts_at"):
         raise ValidationError("grant expiry must be after start")
+    if not entity["data"].get("field_scope"):
+        raise ValidationError("cannot activate grant with empty field scope")
     return {"activated_by": actor.user_id}
 
 
-CUSTOM_CREATE = {'dataset': _validate_dataset, 'application': _validate_application}
-CUSTOM_TRANSITIONS = {('application', 'approve'): _validate_approve, ('grant', 'activate'): _validate_grant_activate}
+def _validate_grant_create(actor, data, lookup):
+    application = _find_one(lookup, "application", "id", data.get("application_id"))
+    if not application:
+        raise ValidationError("application does not exist")
+    if application["status"] != "approved":
+        raise ValidationError("application must be approved before issuing a grant")
+    dataset = _find_one(lookup, "dataset", "id", application["data"].get("dataset_id"))
+    if not dataset:
+        raise ValidationError("dataset does not exist")
+    scope = application["data"].get("field_scope")
+    if not scope:
+        raise ValidationError("application has no approved field scope")
+    return {
+        "field_scope": list(scope),
+        "clearance_level": application["data"].get("clearance_level", 2),
+        "scope_frozen_at": utcnow(),
+        "classification_version": dataset["data"].get("classification_version", 1),
+    }
+
+
+def _validate_reclassify(actor, entity, data, lookup):
+    RuleEngine._ensure_role(actor, ("admin", "committee"))
+    return {"fields": _normalize_fields(data.get("fields"))}
+
+
+CUSTOM_CREATE = {
+    'dataset': _validate_dataset,
+    'application': _validate_application,
+    'grant': _validate_grant_create,
+}
+CUSTOM_TRANSITIONS = {
+    ('application', 'approve'): _validate_approve,
+    ('grant', 'activate'): _validate_grant_activate,
+}
 
 
 class RuleEngine:
@@ -81,8 +198,12 @@ class RuleEngine:
         self._require(data, self.CREATE_REQUIRED.get(kind, ()))
         custom = CUSTOM_CREATE.get(kind)
         if custom:
-            custom(actor, data, lookup)
+            extra = custom(actor, data, lookup) or {}
+            data.update(extra)
         return dict(data)
+
+    def validate_reclassify(self, actor, entity, data):
+        return _validate_reclassify(actor, entity, data, None)
 
     def validate_transition(self, actor, entity, action, data, lookup=None):
         kind = self.normalize_kind(entity["kind"])

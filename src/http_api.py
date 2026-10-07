@@ -85,6 +85,12 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if len(parts) == 4 and parts[0] == "api" and parts[3] == "reconcile":
+                    actor = self._actor()
+                    if parts[1] == "grants":
+                        return self._send(200, service.reconcile(actor, parts[2]))
+                    if parts[1] == "datasets":
+                        return self._send(200, service.reconcile_dataset(actor, parts[2]))
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
@@ -116,7 +122,31 @@ def create_handler(service, rules, static_dir):
                     expected = body.pop("expected_version", None)
                     return self._send(
                         200,
-                        service.transition(actor, parts[2], action, data, expected),
+                        service.transition(
+                            actor,
+                            parts[2],
+                            action,
+                            data,
+                            expected,
+                            self.headers.get("Idempotency-Key"),
+                        ),
+                    )
+                if len(parts) == 4 and parts[0] == "api" and parts[3] == "fetch":
+                    body = self._body()
+                    return self._send(
+                        200, service.fetch(actor, parts[2], body.get("fields"))
+                    )
+                if len(parts) == 4 and parts[0] == "api" and parts[3] == "reclassify":
+                    body = self._body()
+                    return self._send(
+                        200,
+                        service.reclassify(
+                            actor,
+                            parts[2],
+                            body.get("fields"),
+                            body.get("expected_version"),
+                            self.headers.get("Idempotency-Key"),
+                        ),
                     )
                 if len(parts) == 4 and parts[0] == "api" and parts[3] == "actions":
                     body = self._body()
@@ -131,6 +161,7 @@ def create_handler(service, rules, static_dir):
                             action,
                             body.pop("data", body),
                             body.pop("expected_version", None),
+                            self.headers.get("Idempotency-Key"),
                         ),
                     )
                 if len(parts) == 5 and parts[0] == "api" and parts[4] == "actions":

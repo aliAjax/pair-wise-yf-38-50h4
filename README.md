@@ -26,6 +26,15 @@ python3 app.py --db ./data.db --port 8304
 
 - `dataset`：受控数据集；`application`：访问申请；`grant`：限时数据使用凭证。
 
+## 字段范围账
+
+数据集字段按敏感度分级（1=public … 4=restricted），见数据集 `data.fields`。申请获批时按当时分级定下可读字段（`data.field_scope`），签发授权时固定范围；取数只返回范围内字段，越权取范围外字段直接拒绝。
+
+- `POST /api/grants/<id>/fetch`：请求体可带 `{"fields":[...]}`，省略则返回全部范围内字段；越权返回 `403`。
+- `POST /api/datasets/<id>/reclassify`：请求体 `{"fields":[...],"expected_version":数字}`，可带 `Idempotency-Key` 头。一个事务内更新分级表并重算所有授权范围；范围被清空的授权置为 `revoked`，排队未取数的授权一起按新范围执行。失败整批回滚，带同一 `Idempotency-Key` 重试只补没落库的授权。
+- `GET /api/grants/<id>/reconcile`：审计员拿授权固定范围与数据集当前分级表对账，返回 `valid`、`drift`、`stale`。
+- `GET /api/datasets/<id>/reconcile`：数据集下所有授权的对账汇总。
+
 ## 主要接口
 
 - `GET /health`：健康检查。
@@ -33,6 +42,7 @@ python3 app.py --db ./data.db --port 8304
 - `POST /api/<kind>`：创建对象；请求体为JSON。
 - `GET /api/entities/<id>`：读取对象当前版本。
 - `POST /api/entities/<id>/actions`：提交`{"action":"动作名","data":{...},"expected_version":数字}`。
+- `POST /api/<kind>/<id>/actions`：同上的等价路径。
 - `GET /api/audit`：读取审计记录。
 
 请求身份通过`X-User-Id`和`X-Role`请求头传入。创建和动作的可执行角色由规则引擎控制。
