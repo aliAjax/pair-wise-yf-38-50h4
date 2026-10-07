@@ -21,8 +21,11 @@
   <pre>GET  /health
 GET  /api/&lt;kind&gt;
 POST /api/&lt;kind&gt;
+POST /api/&lt;kind&gt;/batch
 GET  /api/entities/&lt;id&gt;
-POST /api/entities/&lt;id&gt;/actions</pre>
+POST /api/entities/&lt;id&gt;/actions
+POST /api/entities/&lt;id&gt;/fetch
+POST /api/audit/reconcile</pre>
 </main>
 <script>
 async function checkHealth() {

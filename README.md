@@ -26,6 +26,18 @@ python3 app.py --db ./data.db --port 8304
 
 - `dataset`：受控数据集；`application`：访问申请；`grant`：限时数据使用凭证。
 
+## 字段范围账
+
+数据集、申请、授权和审计串成一条字段范围账，取数不再默认给整表：
+
+- 数据集用 `field_levels` 给字段分层，级别为 `public < internal < sensitive < restricted`，`classification_version` 随分级改动递增。
+- 申请获批（`approve`）时按**当时**分级快照计算 `field_scope`（可用申请上的 `requested_level` 或审批时的 `approved_level` 控制上限），该快照作为历史账目保留。
+- 范围确认 `confirm_scope`（`approved → scope_confirmed`）：两人同时确认同一申请时先写入的生效，后到的返回 409 并带 `conflict_id` 冲突编号。
+- 授权签发（创建 `grant`）时把申请范围固定进 `scope`；`POST /api/entities/<id>/fetch` 取数只返回范围内字段，请求范围外字段直接 403 拒绝，并写 `fetch` 审计。
+- 数据集 `reclassify` 改动分级后，同一事务内重算该数据集所有未终止授权（含已签发未取数的排队授权）的 `scope`，并逐条写 `scope_recompute` 审计。
+- 批量签发 `POST /api/grants/batch`（`{"batch_id","items":[...]}`）：整批原子写入，任一失败整批撤回；同一 `batch_id` 重试只补没落下的授权。
+- 审计员 `POST /api/audit/reconcile`（`{"dataset_id","external_field_levels"}`）拿授权范围和外部分级表对账，返回越权（`overreach`）与缺失（`missing`）字段差异，并写 `reconcile` 审计。
+
 ## 主要接口
 
 - `GET /health`：健康检查。
@@ -33,6 +45,9 @@ python3 app.py --db ./data.db --port 8304
 - `POST /api/<kind>`：创建对象；请求体为JSON。
 - `GET /api/entities/<id>`：读取对象当前版本。
 - `POST /api/entities/<id>/actions`：提交`{"action":"动作名","data":{...},"expected_version":数字}`。
+- `POST /api/<kind>/batch`：批量创建；请求体`{"batch_id":"批次号","items":[...]}`，整批原子、按`batch_id`幂等重试。
+- `POST /api/entities/<id>/fetch`：按授权范围取数；请求体`{"fields":[...]}`，越权字段直接拒绝。
+- `POST /api/audit/reconcile`：审计员用外部分级表对账；请求体`{"dataset_id":"...","external_field_levels":{...}}`。
 - `GET /api/audit`：读取审计记录。
 
 请求身份通过`X-User-Id`和`X-Role`请求头传入。创建和动作的可执行角色由规则引擎控制。

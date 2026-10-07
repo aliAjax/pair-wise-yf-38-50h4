@@ -140,6 +140,85 @@ class SQLiteRepository:
             connection.close()
         return self.get_entity(entity_id)
 
+    def create_entities_batch(self, items):
+        """Insert many entities in one transaction; all-or-nothing.
+
+        Each item is a dict with keys id, kind, status, data, actor_id, idem_key.
+        Items whose idempotency key already landed are skipped, so a retry only
+        fills in the entities that did not land before. Returns (id, created)
+        pairs for every landed item.
+        """
+        now = utcnow()
+        connection = self._connect()
+        landed = []
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            for item in items:
+                row = connection.execute(
+                    "SELECT entity_id FROM idempotency WHERE actor_id = ? AND idem_key = ?",
+                    (item["actor_id"], item["idem_key"]),
+                ).fetchone()
+                if row:
+                    landed.append((row["entity_id"], False))
+                    continue
+                payload = json.dumps(item["data"], ensure_ascii=False, sort_keys=True)
+                try:
+                    connection.execute(
+                        "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+                        "VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
+                        (item["id"], item["kind"], item["status"], payload, item["actor_id"], now, now),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise ConflictError("entity already exists: " + item["id"]) from exc
+                connection.execute(
+                    "INSERT INTO idempotency(actor_id, idem_key, entity_id, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (item["actor_id"], item["idem_key"], item["id"], now),
+                )
+                landed.append((item["id"], True))
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return landed
+
+    def update_entities_batch(self, updates):
+        """Apply many optimistic-lock updates in one transaction; all-or-nothing.
+
+        Each update is a dict with keys id, expected_version, status, data.
+        """
+        now = utcnow()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            for update in updates:
+                row = connection.execute(
+                    "SELECT version FROM entities WHERE id = ?", (update["id"],)
+                ).fetchone()
+                if not row:
+                    raise NotFoundError("entity not found: " + update["id"])
+                current_version = int(row["version"])
+                expected = update.get("expected_version")
+                if expected is not None and current_version != int(expected):
+                    raise ConflictError(
+                        "version conflict: expected %s, found %s"
+                        % (expected, current_version)
+                    )
+                payload = json.dumps(update["data"], ensure_ascii=False, sort_keys=True)
+                connection.execute(
+                    "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+                    "WHERE id = ? AND version = ?",
+                    (update["status"], payload, now, update["id"], current_version),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
         with self._connect() as connection:
             connection.execute(

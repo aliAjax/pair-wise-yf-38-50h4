@@ -71,7 +71,11 @@ def create_handler(service, rules, static_dir):
                 status = 400
             else:
                 status = 500
-            self._send(status, {"error": str(exc), "type": type(exc).__name__})
+            payload = {"error": str(exc), "type": type(exc).__name__}
+            conflict_id = getattr(exc, "conflict_id", None)
+            if conflict_id:
+                payload["conflict_id"] = conflict_id
+            self._send(status, payload)
 
         def do_GET(self):
             try:
@@ -107,6 +111,16 @@ def create_handler(service, rules, static_dir):
                 parsed = urlparse(self.path)
                 parts = [part for part in parsed.path.split("/") if part]
                 actor = self._actor()
+                if parts == ["api", "audit", "reconcile"]:
+                    body = self._body()
+                    return self._send(
+                        200,
+                        service.reconcile(
+                            actor,
+                            body.get("dataset_id"),
+                            body.get("external_field_levels"),
+                        ),
+                    )
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)
@@ -117,6 +131,25 @@ def create_handler(service, rules, static_dir):
                     return self._send(
                         200,
                         service.transition(actor, parts[2], action, data, expected),
+                    )
+                if len(parts) == 4 and parts[:2] == ["api", "entities"] and parts[3] == "fetch":
+                    body = self._body()
+                    return self._send(
+                        200,
+                        service.fetch(actor, parts[2], body.get("fields")),
+                    )
+                if len(parts) == 3 and parts[0] == "api" and parts[2] == "batch":
+                    body = self._body()
+                    return self._send(
+                        201,
+                        {
+                            "items": service.create_batch(
+                                actor,
+                                parts[1],
+                                body.get("items"),
+                                body.get("batch_id"),
+                            )
+                        },
                     )
                 if len(parts) == 4 and parts[0] == "api" and parts[3] == "actions":
                     body = self._body()
